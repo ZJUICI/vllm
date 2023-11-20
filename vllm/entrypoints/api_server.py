@@ -17,12 +17,6 @@ app = FastAPI()
 engine = None
 
 
-@app.get("/health")
-async def health() -> Response:
-    """Health check."""
-    return Response(status_code=200)
-
-
 @app.post("/generate")
 async def generate(request: Request) -> Response:
     """Generate completion for the request.
@@ -33,25 +27,39 @@ async def generate(request: Request) -> Response:
     - other fields: the sampling parameters (See `SamplingParams` for details).
     """
     request_dict = await request.json()
-    prompt = request_dict.pop("prompt")
+    prompt = request_dict.pop("prompt", None)
+
+    prompt_token_ids = request_dict.pop(
+        "prompt_token_ids",None
+    )  # prompt_token_ids list[list[int]]
+
+    if not prompt and not prompt_token_ids:
+        return JSONResponse(content={"status_code": 422, "msg": "Must pass at least one of `prompt` or `prompt_token_ids`"},status_code=422)
+
     stream = request_dict.pop("stream", False)
+    if stream:
+        return JSONResponse(content={"status_code": 422, "msg": "Streaming not supported"},status_code=422)
+
     sampling_params = SamplingParams(**request_dict)
     request_id = random_uuid()
 
-    results_generator = engine.generate(prompt, sampling_params, request_id)
+    results_generator = engine.generate(
+        prompt=prompt,
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=sampling_params,
+        request_id=request_id,
+    )
 
     # Streaming case
     async def stream_results() -> AsyncGenerator[bytes, None]:
         async for request_output in results_generator:
             prompt = request_output.prompt
-            text_outputs = [
-                prompt + output.text for output in request_output.outputs
-            ]
+            text_outputs = [prompt + output.text for output in request_output.outputs]
             ret = {"text": text_outputs}
             yield (json.dumps(ret) + "\0").encode("utf-8")
 
-    if stream:
-        return StreamingResponse(stream_results())
+    # if stream:
+    #     return StreamingResponse(stream_results())
 
     # Non-streaming case
     final_output = None
@@ -63,9 +71,21 @@ async def generate(request: Request) -> Response:
         final_output = request_output
 
     assert final_output is not None
-    prompt = final_output.prompt
-    text_outputs = [prompt + output.text for output in final_output.outputs]
-    ret = {"text": text_outputs}
+    # prompt = final_output.prompt
+    ret = {}
+    if prompt:
+        text_outputs = [
+            prompt_token_ids + output.token_ids for output in final_output.outputs
+        ]
+        ret["text"] = text_outputs
+    
+    if prompt_token_ids:
+        sequences_ids = [
+            prompt_token_ids + output.token_ids for output in final_output.outputs
+        ]
+
+        ret["sequences"] = sequences_ids
+    
     return JSONResponse(ret)
 
 
@@ -79,8 +99,10 @@ if __name__ == "__main__":
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
 
-    uvicorn.run(app,
-                host=args.host,
-                port=args.port,
-                log_level="debug",
-                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="debug",
+        timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+    )
