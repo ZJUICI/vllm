@@ -74,9 +74,7 @@ async def generate(request: Request) -> Response:
     # prompt = final_output.prompt
     ret = {}
     if prompt:
-        text_outputs = [
-            prompt_token_ids + output.token_ids for output in final_output.outputs
-        ]
+        text_outputs = [prompt + output.text for output in final_output.outputs]
         ret["text"] = text_outputs
     
     if prompt_token_ids:
