@@ -1,9 +1,10 @@
 import codecs
+import inspect
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import (Any, Awaitable, Iterable, List, Literal, Optional, Tuple,
-                    Union)
+                    Union, cast)
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -16,11 +17,12 @@ from openai.types.chat import (
 # yapf: enable
 # pydantic needs the TypedDict from typing_extensions
 from pydantic import ConfigDict, TypeAdapter
-from typing_extensions import Required, TypeAlias, TypedDict
+from typing_extensions import Required, TypedDict
 
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalDataDict
+from vllm.multimodal.base import Table
 from vllm.multimodal.utils import (async_get_and_parse_audio,
                                    async_get_and_parse_image)
 from vllm.transformers_utils.tokenizer import AnyTokenizer
@@ -49,9 +51,17 @@ class CustomChatCompletionContentPartParam(TypedDict, total=False):
     """The type of the content part."""
 
 
-ChatCompletionContentPartParam: TypeAlias = Union[
-    OpenAIChatCompletionContentPartParam, ChatCompletionContentPartAudioParam,
-    CustomChatCompletionContentPartParam, ]
+class ChatCompletionContentPartTabularParam(TypedDict, total=False):
+    tables: Required[List[Table]]
+
+    type: Required[Literal["table"]]
+    """The type of the content part."""
+
+
+ChatCompletionContentPartParam = Union[OpenAIChatCompletionContentPartParam,
+                                       ChatCompletionContentPartAudioParam,
+                                       ChatCompletionContentPartTabularParam,
+                                       CustomChatCompletionContentPartParam]
 
 
 class CustomChatCompletionMessageParam(TypedDict, total=False):
@@ -83,7 +93,7 @@ class ConversationMessage(TypedDict):
 @dataclass(frozen=True)
 class ChatMessageParseResult:
     messages: List[ConversationMessage]
-    mm_futures: List[Awaitable[MultiModalDataDict]]
+    mm_futures: List[Union[Awaitable[MultiModalDataDict], MultiModalDataDict]]
 
 
 def load_chat_template(
@@ -155,6 +165,37 @@ def _get_full_multimodal_text_prompt(placeholder_token_str: str,
 _TextParser = TypeAdapter(ChatCompletionContentPartTextParam)
 _ImageParser = TypeAdapter(ChatCompletionContentPartImageParam)
 _AudioParser = TypeAdapter(ChatCompletionContentPartAudioParam)
+_TabularParser = TypeAdapter(ChatCompletionContentPartTabularParam)
+
+
+def __dataframe_info_simple(table: Table, model_config: ModelConfig) -> str:
+
+    insert_embs_token = model_config.hf_config.encoder_config.insert_embs_token
+    insert_seq_token = model_config.hf_config.encoder_config.insert_seq_token
+
+    placeholder_val = (insert_seq_token + insert_embs_token + insert_seq_token)
+
+    desc_info_lines = [
+        (f"- {placeholder_val} \'{col['name']}\' {col['dtype']}")
+        for col in table["columns"]
+    ]
+
+    desc_info = "\n".join(desc_info_lines)
+
+    return f"{desc_info}\n"
+
+
+def __build_table_question(tables: List[Table], model_config: ModelConfig):
+    
+    f = partial(__dataframe_info_simple, model_config=model_config)
+
+    df_info_list = [f(table) for table in tables]
+    return ''.join(df_info_list)
+
+
+def _get_full_table_text_prompt(tables: List[Table],
+                                model_config: ModelConfig) -> str:
+    return __build_table_question(tables, model_config)
 
 
 def _parse_chat_message_content_parts(
@@ -164,8 +205,10 @@ def _parse_chat_message_content_parts(
     tokenizer: AnyTokenizer,
 ) -> ChatMessageParseResult:
     texts: List[str] = []
-    mm_futures: List[Awaitable[MultiModalDataDict]] = []
-    modality: Literal["image", "audio"] = "image"
+    mm_futures: List[Union[Awaitable[MultiModalDataDict],
+                           MultiModalDataDict]] = []
+
+    modality: Literal["image", "audio", "tabular"] = "image"
 
     for part in parts:
         part_type = part["type"]
@@ -187,6 +230,18 @@ def _parse_chat_message_content_parts(
 
             image_future = async_get_and_parse_image(image_url["url"])
             mm_futures.append(image_future)
+
+        elif part_type == "table":
+            if len(mm_futures) > 0:
+                raise NotImplementedError(
+                    "Multiple 'table' input is currently not supported.")
+
+            table_data: List[Table] = _TabularParser.validate_python(
+                part)["tables"]
+
+            mm_futures.append({"table": table_data})
+            modality = "tabular"
+
         elif part_type == "audio_url":
             modality = "audio"
             if len(mm_futures) > 0:
@@ -202,18 +257,31 @@ def _parse_chat_message_content_parts(
     text_prompt = "\n".join(texts)
 
     if mm_futures:
-        placeholder_token_str = _mm_token_str(model_config, tokenizer,
-                                              modality)
-        if placeholder_token_str is not None:
-            if placeholder_token_str in text_prompt:
-                logger.warning(
-                    "Detected multi-modal token string in the text prompt. "
-                    "Skipping prompt formatting.")
-            else:
-                text_prompt = _get_full_multimodal_text_prompt(
-                    placeholder_token_str=placeholder_token_str,
-                    text_prompt=text_prompt,
-                )
+        if modality == "tabular":
+            if inspect.isawaitable(mm_futures[0]):
+                raise ValueError("tabular table data cannot awaitable")
+
+            mm_data = mm_futures[0]
+
+            table = cast(List[Table], mm_data["table"])
+            placeholder_token_str = _get_full_table_text_prompt(table, model_config)
+
+            text_prompt = _get_full_multimodal_text_prompt(placeholder_token_str=placeholder_token_str,
+                                                           text_prompt=text_prompt)
+
+        else:
+            placeholder_token_str = _mm_token_str(model_config, tokenizer,
+                                                  modality)
+            if placeholder_token_str is not None:
+                if placeholder_token_str in text_prompt:
+                    logger.warning(
+                        "Detected multi-modal token string in the text prompt. "
+                        "Skipping prompt formatting.")
+                else:
+                    text_prompt = _get_full_multimodal_text_prompt(
+                        placeholder_token_str=placeholder_token_str,
+                        text_prompt=text_prompt,
+                    )
 
     messages = [ConversationMessage(role=role, content=text_prompt)]
 
@@ -246,9 +314,11 @@ def parse_chat_messages(
     messages: List[ChatCompletionMessageParam],
     model_config: ModelConfig,
     tokenizer: AnyTokenizer,
-) -> Tuple[List[ConversationMessage], List[Awaitable[MultiModalDataDict]]]:
+) -> Tuple[List[ConversationMessage], List[Union[Awaitable[MultiModalDataDict],
+                                                 MultiModalDataDict]]]:
     conversation: List[ConversationMessage] = []
-    mm_futures: List[Awaitable[MultiModalDataDict]] = []
+    mm_futures: List[Union[Awaitable[MultiModalDataDict],
+                           MultiModalDataDict]] = []
 
     for msg in messages:
         parse_result = _parse_chat_message_content(msg, model_config,
